@@ -1,0 +1,6 @@
+pillow
+albumentations
+pandas
+scikit-learn
+streamlit
+opencv-python
