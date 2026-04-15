@@ -62,7 +62,7 @@ scipy==1.15.2
 seaborn==0.13.2
 six==1.17.0
 stack-data==0.6.3
-streamlit==1.41.1
+streamlit==1.54.0
 tensorboard==2.19.0
 tensorboard-data-server==0.7.2
 tensorflow==2.19.0
