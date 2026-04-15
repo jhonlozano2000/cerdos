@@ -127,3 +127,5 @@ dmypy.json
 /imagenes originales
 /imagenes_originales
 /dataset_procesado
+/dataset_test
+/dataset
