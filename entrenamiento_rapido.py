@@ -1,10 +1,6 @@
 """
-Entrenamiento Mejorado para Identificación de Cerdas
-Características:
-- Augmentation on-the-fly con Albumentations
-- Fine-tuning progresivo
-- Split estratificado
-- Early stopping y learning rate scheduler
+Entrenamiento Optimizado para Identificación de Cerdas
+Versión rápida usando ImageDataGenerator de Keras
 """
 
 import os
@@ -19,14 +15,12 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-import albumentations as A
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from collections import defaultdict
 
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 64
-EPOCHS = 30
+EPOCHS = 15
 SEED = 42
 
 BASE_DIR = Path("dataset_procesado")
@@ -38,15 +32,18 @@ random.seed(SEED)
 tf.random.set_seed(SEED)
 
 print("=" * 50)
-print("🎯 Entrenamiento Mejorado - Identificación de Cerdas")
+print("🎯 Entrenamiento Rápido - Identificación de Cerdas")
 print("=" * 50)
 
 def get_class_directories():
     classes = sorted([d for d in os.listdir(BASE_DIR) if (BASE_DIR / d).is_dir()])
     print(f"\n📁 Clases encontradas: {len(classes)}")
+    total = 0
     for c in classes:
         count = len(list((BASE_DIR / c).glob("*")))
         print(f"   - {c}: {count} imágenes")
+        total += count
+    print(f"\n📊 Total: {total} imágenes")
     return classes
 
 def split_dataset_stratified(classes, test_size=0.2):
@@ -89,61 +86,50 @@ def split_dataset_stratified(classes, test_size=0.2):
     
     return train, val, test
 
-def create_augmentation_pipeline():
-    """Pipeline de augmentación on-the-fly"""
-    return A.Compose([
-        A.HorizontalFlip(p=0.5),
-        A.Rotate(limit=15, p=0.5),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
-        A.Blur(blur_limit=3, p=0.3),
-        A.Resize(*IMG_SIZE),
-    ])
-
-def load_and_augment_image(image_path, augment=None):
-    """Carga y aplica augmentación a una imagen"""
-    import cv2
-    img = cv2.imread(image_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+def create_generators(train_df, val_df, classes):
+    """Crea generadores optimizados"""
     
-    if augment:
-        augmented = augment(image=img)
-        img = augmented['image']
-    
-    img = cv2.resize(img, IMG_SIZE)
-    img = img.astype(np.float32) / 255.0
-    return img
-
-def create_dataset_from_dataframe(df, classes, augment=None, shuffle=False):
-    """Crea un dataset de TensorFlow desde DataFrame"""
-    class_to_idx = {c: i for i, c in enumerate(classes)}
-    num_classes = len(classes)
-    
-    def generator():
-        while True:
-            if shuffle:
-                df_sample = df.sample(frac=1, random_state=SEED)
-            else:
-                df_sample = df
-            
-            for _, row in df_sample.iterrows():
-                img = load_and_augment_image(row['path'], augment)
-                label = class_to_idx[row['class_name']]
-                
-                yield img, label
-    
-    dataset = tf.data.Dataset.from_generator(
-        generator,
-        output_signature=(
-            tf.TensorSpec(shape=(*IMG_SIZE, 3), dtype=tf.float32),
-            tf.TensorSpec(shape=(), dtype=tf.int32)
-        )
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=20,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        horizontal_flip=True,
+        brightness_range=[0.8, 1.2],
+        zoom_range=0.2,
+        fill_mode='nearest'
     )
     
-    return dataset
+    val_datagen = ImageDataGenerator(rescale=1./255)
+    
+    train_generator = train_datagen.flow_from_dataframe(
+        train_df,
+        x_col='path',
+        y_col='class_name',
+        target_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        class_mode='sparse',
+        shuffle=True,
+        seed=SEED
+    )
+    
+    val_generator = val_datagen.flow_from_dataframe(
+        val_df,
+        x_col='path',
+        y_col='class_name',
+        target_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        class_mode='sparse',
+        shuffle=False,
+        seed=SEED
+    )
+    
+    print(f"\n��� Clases: {train_generator.class_indices}")
+    
+    return train_generator, val_generator
 
 def build_model(num_classes):
-    """Construye el modelo con fine-tuning"""
+    """Construye el modelo con MobileNetV2"""
     
     base_model = keras.applications.MobileNetV2(
         input_shape=(*IMG_SIZE, 3),
@@ -187,6 +173,23 @@ def unfreeze_and_finetune(model, unfreeze_from=100):
     
     print(f"✅ Fine-tuning: {sum([layer.trainable for layer in base_model.layers])} capas entrenables")
 
+def create_test_generator(test_df):
+    """Crea generador para test"""
+    test_datagen = ImageDataGenerator(rescale=1./255)
+    
+    test_generator = test_datagen.flow_from_dataframe(
+        test_df,
+        x_col='path',
+        y_col='class_name',
+        target_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        class_mode='sparse',
+        shuffle=False,
+        seed=SEED
+    )
+    
+    return test_generator
+
 def main():
     classes = get_class_directories()
     num_classes = len(classes)
@@ -198,15 +201,14 @@ def main():
     test_df.to_csv(OUTPUT_DIR / "test_split.csv", index=False)
     print(f"\n💾 Splits guardados en {OUTPUT_DIR}")
     
-    augment = create_augmentation_pipeline()
+    train_ds, val_ds = create_generators(train_df, val_df, classes)
+    test_ds = create_test_generator(test_df)
     
-    train_ds = create_dataset_from_dataframe(train_df, classes, augment, shuffle=True)
-    val_ds = create_dataset_from_dataframe(val_df, classes, augment=None, shuffle=False)
-    test_ds = create_dataset_from_dataframe(test_df, classes, augment=None, shuffle=False)
+    steps_per_epoch = train_ds.samples // BATCH_SIZE
+    validation_steps = val_ds.samples // BATCH_SIZE
     
-    train_ds = train_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-    val_ds = val_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-    test_ds = test_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    print(f"\n⚡ Steps por epoch: {steps_per_epoch}")
+    print(f"⚡ Batch size: {BATCH_SIZE}")
     
     print("\n🔧 Construyendo modelo...")
     model = build_model(num_classes)
@@ -226,7 +228,7 @@ def main():
             verbose=1
         ),
         ModelCheckpoint(
-            OUTPUT_DIR / "best_model.h5",
+            str(OUTPUT_DIR / "best_model.keras"),
             monitor='val_accuracy',
             save_best_only=True,
             verbose=1
@@ -237,7 +239,9 @@ def main():
     history = model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=15,
+        epochs=EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
         callbacks=callbacks
     )
     
@@ -247,7 +251,9 @@ def main():
     history_finetune = model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=15,
+        epochs=5,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
         callbacks=callbacks
     )
     
@@ -255,8 +261,8 @@ def main():
     test_results = model.evaluate(test_ds)
     print(f"Test Accuracy: {test_results[1]:.2%}")
     
-    model.save(OUTPUT_DIR / "modelo_final.h5")
-    print(f"\n✅ Modelo guardado en: {OUTPUT_DIR / 'modelo_final.h5'}")
+    model.save(OUTPUT_DIR / "modelo_final.keras")
+    print(f"\n✅ Modelo guardado en: {OUTPUT_DIR / 'modelo_final.keras'}")
 
 if __name__ == "__main__":
     main()
