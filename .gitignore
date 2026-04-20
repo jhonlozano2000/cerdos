@@ -129,3 +129,5 @@ dmypy.json
 /dataset_procesado
 /dataset_test
 /dataset
+/output/yolo_detector/images
+/output/yolo_detector/labels
