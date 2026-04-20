@@ -7,6 +7,7 @@ import os
 import io
 import base64
 import numpy as np
+import torch
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -188,6 +189,63 @@ async def confirmar(data: ConfirmacionRequest):
         "success": True,
         "message": "Confirmación registrada",
         "data": data.dict()
+    }
+
+# YOLO Detection
+from ultralytics import YOLO
+
+YOLO_MODEL_PATH = os.path.join(os.path.dirname(__file__), "runs", "detect", "output", "yolo_detector", "runs", "weights", "best.pt")
+yolo_model = None
+
+def load_yolo():
+    global yolo_model
+    if yolo_model is None:
+        yolo_model = YOLO(YOLO_MODEL_PATH)
+        print(f"YOLO cargado: {yolo_model.model.names}")
+    return yolo_model
+
+@app.post("/detectar")
+async def detectar(file: UploadFile = File(...)):
+    """Detecta cerdas en una imagen"""
+    try:
+        model = load_yolo()
+        
+        # Leer imagen
+        image_bytes = await file.read()
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        # Detectar
+        results = model(img, conf=0.25, verbose=False)
+        
+        deteccions = []
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                deteccions.append({
+                    "clase": model.model.names[int(box.cls[0])],
+                    "confianza": round(float(box.conf[0]) * 100),
+                    "bbox": box.xyxy[0].tolist()
+                })
+        
+        return {
+            "success": True,
+            "detecciones": len(deteccions),
+            "resultados": deteccions
+        }
+        
+    except Exception as e:
+        print(f"Error detección: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/detector/status")
+async def detector_status():
+    """Estado del detector YOLO"""
+    model = load_yolo()
+    return {
+        "success": True,
+        "modelo": "YOLOv8",
+        "clases": model.model.names,
+        "peso": YOLO_MODEL_PATH
     }
 
 # Endpoint de prueba
