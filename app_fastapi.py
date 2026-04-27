@@ -194,7 +194,7 @@ async def confirmar(data: ConfirmacionRequest):
 # YOLO Detection
 from ultralytics import YOLO
 
-YOLO_MODEL_PATH = os.path.join(os.path.dirname(__file__), "runs", "detect", "output", "yolo_detector", "runs", "weights", "best.pt")
+YOLO_MODEL_PATH = r"C:\Users\Jhon\Desktop\cerdos\runs\detect\output\yolo_detector\runs\weights\best.pt"
 yolo_model = None
 
 def load_yolo():
