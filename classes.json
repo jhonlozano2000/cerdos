@@ -11,9 +11,10 @@
     "cerda_009",
     "cerda_010",
     "cerda_011",
-    "cerda_012"
+    "cerda_012",
+    "no_cerdo"
   ],
-  "num_classes": 12,
+  "num_classes": 13,
   "threshold": 0.6,
   "model_input_size": [
     224,
@@ -21,10 +22,10 @@
   ],
   "version": "2.0",
   "training_info": {
-    "total_train_images": 3008,
-    "total_val_images": 746,
-    "best_val_accuracy_phase1": 0.788203775882721,
-    "best_val_accuracy_phase2": 0.8552278876304626,
+    "total_train_images": 8970,
+    "total_val_images": 2236,
+    "best_val_accuracy_phase1": 0.9194990992546082,
+    "best_val_accuracy_phase2": 0.9378353953361511,
     "epochs_phase1": 15,
     "epochs_phase2": 20,
     "augmentation": true,
