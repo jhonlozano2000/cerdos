@@ -1,0 +1,34 @@
+{
+  "classes": [
+    "cerda_001",
+    "cerda_002",
+    "cerda_003",
+    "cerda_004",
+    "cerda_005",
+    "cerda_006",
+    "cerda_007",
+    "cerda_008",
+    "cerda_009",
+    "cerda_010",
+    "cerda_011",
+    "cerda_012"
+  ],
+  "num_classes": 12,
+  "threshold": 0.6,
+  "model_input_size": [
+    224,
+    224
+  ],
+  "version": "2.0",
+  "training_info": {
+    "total_train_images": 3008,
+    "total_val_images": 746,
+    "best_val_accuracy_phase1": 0.788203775882721,
+    "best_val_accuracy_phase2": 0.8552278876304626,
+    "epochs_phase1": 15,
+    "epochs_phase2": 20,
+    "augmentation": true,
+    "class_weights": true,
+    "fine_tuning": true
+  }
+}
