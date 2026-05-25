@@ -1,34 +1,62 @@
 """
 Entrenamiento Mejorado - Reconocimiento de Cerdas v2.0
 ======================================================
-- MobileNetV2 con fine-tuning
-- Data augmentation agresiva
-- Class weights automaticos para balancear
-- Early stopping + ReduceLROnPlateau
-- Guarda classes.json junto al modelo
-- Soporte para progreso via archivo JSON (entrenamiento gestionado)
+Pipeline de entrenamiento en 2 fases para MobileNetV2:
 
-Uso: python entrenar_v2.py [--task-id ID] [--task-dir DIR] [--include-classes LISTA]
+1. Fase Frozen (15 epochs):
+   - Base del modelo congelada (pesos ImageNet)
+   - Solo entrena la cabeza de clasificación (head)
+
+2. Fase Fine-Tuning (20 epochs):
+   - Últimas 30 capas descongeladas
+   - Learning rate reducido (2e-5)
+
+Características:
+- Data augmentation agresiva (rotación, zoom, flip, brillo)
+- Class weights automáticos para balanceo
+- Early stopping + ReduceLROnPlateau
+- Reporte de progreso vía PROGRESS:JSON lines
+- Backup automático del modelo a producción
+
+Ejecutado por training_manager.py como subproceso.
+Uso directo: python entrenar_v2.py [--task-id ID] [--task-dir DIR] [--include-classes LISTA]
 """
 
 import os
 import sys
 import json
 import argparse
+import shutil
 import numpy as np
 from pathlib import Path
 from datetime import datetime
 
-# Configuracion
+
+# ── Configuración ──────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-DATASET_DIR = Path(r"C:\laragon\www\Porci-Integral-backend\storage\app\public\fotos_animales")
+
+# Carga manual del .env (misma lógica que app_fastapi.py)
+_env_path = BASE_DIR / ".env"
+if _env_path.exists():
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                if _k.strip() not in os.environ:
+                    os.environ[_k.strip()] = _v.strip()
+
+DATASET_DIR = Path(os.environ.get(
+    "DATASET_PATH",
+    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\fotos_animales"
+))
 OUTPUT_DIR = BASE_DIR / "output_v2"
 MODEL_NAME = "modelo_identificacion_cerdos_v2.h5"
 
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 16
-EPOCHS_FROZEN = 15
-EPOCHS_FINETUNE = 20
+EPOCHS_FROZEN = 15       # Fase 1: solo cabeza de clasificación
+EPOCHS_FINETUNE = 20     # Fase 2: fine-tuning capas superiores
 LEARNING_RATE = 0.0001
 FINETUNE_LR = 0.00002
 VALIDATION_SPLIT = 0.2
@@ -40,6 +68,12 @@ PROGRESS_FILE = "progress.json"
 
 
 def report_progress(task_dir, **kwargs):
+    """
+    Reporta progreso del entrenamiento.
+    Escribe en el archivo progress.json del task_dir y también
+    imprime una línea PROGRESS:{json} para que training_manager.py
+    pueda capturarla desde stdout.
+    """
     if task_dir:
         path = Path(task_dir) / PROGRESS_FILE
         try:
@@ -61,12 +95,15 @@ def main():
     parser = argparse.ArgumentParser(description="Entrenar modelo de reconocimiento")
     parser.add_argument("--task-id", default="")
     parser.add_argument("--task-dir", default="")
-    parser.add_argument("--include-classes", default="", help="Clases a incluir separadas por coma")
+    parser.add_argument("--include-classes", default="",
+                        help="Clases a incluir separadas por coma")
     args = parser.parse_args()
 
     task_dir = args.task_dir
-    include_list = [c.strip() for c in args.include_classes.split(",") if c.strip()] if args.include_classes else None
+    include_list = [c.strip() for c in args.include_classes.split(",") if c.strip()] \
+                   if args.include_classes else None
 
+    # ── Imports diferidos (solo se cargan al ejecutar, no al importar) ──
     import tensorflow as tf
     from tensorflow.keras.preprocessing.image import ImageDataGenerator
     from tensorflow.keras.applications import MobileNetV2
@@ -80,6 +117,8 @@ def main():
     )
     from sklearn.utils.class_weight import compute_class_weight
 
+    # ── Progress Callback personalizado ───────────────────────
+    # Envía métricas de cada época al training_manager
     class ProgressCallback(Callback):
         def __init__(self, task_dir, total_epochs, phase):
             super().__init__()
@@ -98,6 +137,7 @@ def main():
             if val_acc > self.best_val_acc:
                 self.best_val_acc = val_acc
 
+            # Progreso global: 0-50% frozen, 50-100% finetune
             progress_pct = int(((epoch + 1) / self.total_epochs) * 50)
             if self.phase == "finetune":
                 progress_pct += 50
@@ -113,10 +153,15 @@ def main():
                 current_val_loss=float(val_loss),
                 best_val_accuracy=float(self.best_val_acc),
                 progress_pct=progress_pct,
-                message=f"Fase {self.phase}: época {epoch + 1}/{self.total_epochs} - acc: {acc:.4f} - val_acc: {val_acc:.4f}",
+                message=f"Fase {self.phase}: época {epoch + 1}/{self.total_epochs} "
+                        f"- acc: {acc:.4f} - val_acc: {val_acc:.4f}",
             )
 
-    report_progress(task_dir, status="running", phase="preparing", message="Configurando data augmentation...", progress_pct=2)
+    # ── Data Augmentation ─────────────────────────────────────
+    # Train: con augmentation para mejorar generalización
+    # Validation: solo rescale, sin augmentation
+    report_progress(task_dir, status="running", phase="preparing",
+                    message="Configurando data augmentation...", progress_pct=2)
 
     train_datagen = ImageDataGenerator(
         rescale=1.0 / 255,
@@ -140,12 +185,14 @@ def main():
         datasets_to_use = [d for d in include_list if (DATASET_DIR / d).is_dir()]
         if not datasets_to_use:
             print("ERROR: Ninguna de las clases especificadas existe en el dataset")
-            report_progress(task_dir, status="error", message="Ninguna clase especificada existe en el dataset")
+            report_progress(task_dir, status="error",
+                            message="Ninguna clase especificada existe en el dataset")
             sys.exit(1)
         print(f"Usando solo clases: {datasets_to_use}")
     else:
         datasets_to_use = None
 
+    # ── Generadores ───────────────────────────────────────────
     train_generator = train_datagen.flow_from_directory(
         str(DATASET_DIR),
         target_size=IMG_SIZE,
@@ -175,7 +222,11 @@ def main():
     print(f"   Imagenes train: {train_generator.samples}")
     print(f"   Imagenes val: {val_generator.samples}")
 
-    report_progress(task_dir, status="running", phase="preparing", message="Calculando class weights...", progress_pct=5, classes_found=class_names)
+    # ── Class Weights ─────────────────────────────────────────
+    # Balancea clases con pocas imágenes dándoles más peso en la pérdida
+    report_progress(task_dir, status="running", phase="preparing",
+                    message="Calculando class weights...", progress_pct=5,
+                    classes_found=class_names)
 
     labels = train_generator.classes
     unique_classes = np.unique(labels)
@@ -188,15 +239,18 @@ def main():
         w = class_weight_dict.get(idx, 1.0)
         print(f"   [{idx}] {name}: {count} imgs, weight={w:.3f}")
 
-    report_progress(task_dir, status="running", phase="building_model", message="Construyendo modelo MobileNetV2...", progress_pct=7)
+    # ── Arquitectura del Modelo ───────────────────────────────
+    report_progress(task_dir, status="running", phase="building_model",
+                    message="Construyendo modelo MobileNetV2...", progress_pct=7)
 
     base_model = MobileNetV2(
         weights="imagenet",
         include_top=False,
         input_shape=(*IMG_SIZE, 3),
     )
-    base_model.trainable = False
+    base_model.trainable = False  # Se congela para fase 1
 
+    # Cabeza de clasificación personalizada
     x = base_model.output
     x = GlobalAveragePooling2D()(x)
     x = BatchNormalization()(x)
@@ -221,11 +275,16 @@ def main():
     print(f"   Total params: {total_params:,}")
     print(f"   Trainable params: {trainable_params:,}")
 
+    # ═══════════════════════════════════════════════════════════
+    # FASE 1: Frozen — solo entrena la cabeza
+    # ═══════════════════════════════════════════════════════════
     print(f"\n[Fase 1] Entrenando cabeza ({EPOCHS_FROZEN} epochs)...")
 
     callbacks_phase1 = [
-        EarlyStopping(monitor="val_accuracy", patience=5, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1),
+        EarlyStopping(monitor="val_accuracy", patience=5,
+                      restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                          patience=3, min_lr=1e-6, verbose=1),
         ProgressCallback(task_dir, EPOCHS_FROZEN, phase="frozen"),
     ]
 
@@ -241,6 +300,9 @@ def main():
     best_val_acc_phase1 = max(history1.history["val_accuracy"])
     print(f"   Mejor val_accuracy fase 1: {best_val_acc_phase1:.4f}")
 
+    # ═══════════════════════════════════════════════════════════
+    # FASE 2: Fine-tuning — descongela últimas 30 capas
+    # ═══════════════════════════════════════════════════════════
     print(f"\n[Fase 2] Fine-tuning capas superiores ({EPOCHS_FINETUNE} epochs)...")
 
     for layer in base_model.layers[-30:]:
@@ -253,9 +315,12 @@ def main():
     )
 
     callbacks_phase2 = [
-        EarlyStopping(monitor="val_accuracy", patience=7, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-7, verbose=1),
-        ModelCheckpoint(str(OUTPUT_DIR / "best_model_v2.h5"), monitor="val_accuracy", save_best_only=True, verbose=1),
+        EarlyStopping(monitor="val_accuracy", patience=7,
+                      restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                          patience=3, min_lr=1e-7, verbose=1),
+        ModelCheckpoint(str(OUTPUT_DIR / "best_model_v2.h5"),
+                        monitor="val_accuracy", save_best_only=True, verbose=1),
         ProgressCallback(task_dir, EPOCHS_FINETUNE, phase="finetune"),
     ]
 
@@ -271,6 +336,7 @@ def main():
     best_val_acc_phase2 = max(history2.history["val_accuracy"])
     print(f"   Mejor val_accuracy fase 2: {best_val_acc_phase2:.4f}")
 
+    # ── Guardado de modelo y classes ──────────────────────────
     final_model_path = OUTPUT_DIR / MODEL_NAME
     model.save(str(final_model_path))
     print(f"\n   Modelo guardado: {final_model_path}")
@@ -299,7 +365,7 @@ def main():
         json.dump(classes_data, f, indent=2, ensure_ascii=False)
     print(f"   Classes guardado: {classes_path}")
 
-    import shutil
+    # Copia a producción (modelo_identificacion_cerdos.h5 raíz)
     prod_model_path = BASE_DIR / "modelo_identificacion_cerdos.h5"
     shutil.copy2(str(final_model_path), str(prod_model_path))
     print(f"   Modelo copiado a produccion: {prod_model_path}")
@@ -308,12 +374,14 @@ def main():
     shutil.copy2(str(classes_path), str(prod_classes_path))
     print(f"   Classes copiado a produccion: {prod_classes_path}")
 
+    # Copia adicional a Laragon ML si existe
     laragon_ml = Path(r"C:\laragon\www\Porci-Integral-ML")
     if laragon_ml.exists():
         shutil.copy2(str(final_model_path), str(laragon_ml / "modelo_identificacion_cerdos.h5"))
         shutil.copy2(str(classes_path), str(laragon_ml / "classes.json"))
         print(f"   Modelo copiado a Laragon ML: {laragon_ml}")
 
+    # Reporte final
     report_progress(
         task_dir,
         status="completed",

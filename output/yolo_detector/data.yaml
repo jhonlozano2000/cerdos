@@ -1,6 +1,0 @@
-path: output\yolo_detector
-train: images/train
-val: images/val
-
-names:
-  0: cerda

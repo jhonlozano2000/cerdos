@@ -1,3 +1,0 @@
-pillow
-pandas
-opencv-python-headless
