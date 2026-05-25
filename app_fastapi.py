@@ -51,7 +51,7 @@ DATASET_PATH = os.environ.get(
     r"C:\laragon\www\Porci-Integral-backend\storage\app\public\fotos_animales"
 )
 IMG_SIZE = (224, 224)
-THRESHOLD = 0.50  # Mínimo de confianza para considerar una predicción válida
+THRESHOLD = 0.50  # Se sobreescribe desde classes.json si existe
 
 MODELS_BACKUP_DIR.mkdir(exist_ok=True)
 
@@ -124,9 +124,14 @@ app.add_middleware(
 
 def load_classes():
     """
-    Escanea DATASET_PATH y retorna los nombres de directorio
-    como lista de clases disponibles para clasificación.
+    Carga la lista de clases desde classes.json (autoritativo).
+    Si no existe, escanea DATASET_PATH como fallback.
     """
+    classes_file = BASE_DIR / "classes.json"
+    if classes_file.exists():
+        with open(classes_file) as f:
+            data = json.load(f)
+        return data.get("classes", [])
     if os.path.exists(DATASET_PATH):
         classes = sorted([d for d in os.listdir(DATASET_PATH)
                          if os.path.isdir(os.path.join(DATASET_PATH, d))])
@@ -135,6 +140,14 @@ def load_classes():
 
 
 CLASS_NAMES = load_classes()
+
+# Sobreescribe THRESHOLD desde classes.json si está disponible
+_classes_file = BASE_DIR / "classes.json"
+if _classes_file.exists():
+    with open(_classes_file) as _f:
+        _data = json.load(_f)
+    if "threshold" in _data:
+        THRESHOLD = _data["threshold"]
 print(f"Clases cargadas: {len(CLASS_NAMES)} - {CLASS_NAMES}")
 
 model = None
