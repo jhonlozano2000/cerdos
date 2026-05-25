@@ -5,7 +5,9 @@ Uso: uvicorn app_fastapi:app --reload
 
 import os
 import io
+import json
 import base64
+from datetime import datetime
 import numpy as np
 import torch
 from PIL import Image
@@ -15,10 +17,12 @@ from pydantic import BaseModel
 from typing import List, Optional
 import tensorflow as tf
 import cv2
+from pathlib import Path
+from training_manager import manager
 
 # Configuration
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "modelo_identificacion_cerdos.h5")
-DATASET_PATH = os.path.join(os.path.dirname(__file__), "dataset_procesado")
+DATASET_PATH = r"C:\laragon\www\Porci-Integral-backend\storage\app\public\fotos_animales"
 IMG_SIZE = (224, 224)
 THRESHOLD = 0.50  # 50% confianza mínima
 
@@ -247,6 +251,115 @@ async def detector_status():
         "clases": model.model.names,
         "peso": YOLO_MODEL_PATH
     }
+
+# ============ NUEVOS ENDPOINTS: EXPORTAR, ESTADISTICAS, ENTRENAR ============
+
+class ExportarFotoRequest(BaseModel):
+    class_name: str
+    image_base64: str
+
+@app.post("/exportar-foto")
+async def exportar_foto(data: ExportarFotoRequest):
+    """Guarda una foto en el dataset de entrenamiento"""
+    try:
+        class_name = data.class_name.strip()
+        if not class_name:
+            raise HTTPException(status_code=400, detail="class_name es requerido")
+
+        class_dir = os.path.join(DATASET_PATH, class_name)
+        os.makedirs(class_dir, exist_ok=True)
+
+        image_data = data.image_base64
+        if "," in image_data:
+            image_data = image_data.split(",")[1]
+
+        image_bytes = base64.b64decode(image_data)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{class_name}_{timestamp}.jpg"
+        filepath = os.path.join(class_dir, filename)
+
+        with open(filepath, "wb") as f:
+            f.write(image_bytes)
+
+        return {"success": True, "filename": filename, "class_name": class_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dataset-estadisticas")
+async def dataset_estadisticas():
+    """Retorna estadisticas del dataset de entrenamiento"""
+    try:
+        if not os.path.exists(DATASET_PATH):
+            return {"clases": [], "total_global": 0, "total_clases": 0}
+
+        clases = []
+        total_global = 0
+        for d in sorted(os.listdir(DATASET_PATH)):
+            dir_path = os.path.join(DATASET_PATH, d)
+            if os.path.isdir(dir_path):
+                count = len([f for f in os.listdir(dir_path)
+                           if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))])
+                clases.append({"nombre": d, "total": count})
+                total_global += count
+
+        return {
+            "clases": clases,
+            "total_global": total_global,
+            "total_clases": len(clases),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class EntrenarRequest(BaseModel):
+    include_classes: Optional[List[str]] = None
+    exclude_classes: Optional[List[str]] = None
+
+
+@app.post("/entrenar")
+async def iniciar_entrenamiento(data: EntrenarRequest = None):
+    """Inicia entrenamiento asincrono del modelo"""
+    try:
+        include = data.include_classes if data else None
+        exclude = data.exclude_classes if data else None
+
+        task_id = manager.start_training(include_classes=include, exclude_classes=exclude)
+        return {"success": True, "task_id": task_id, "message": "Entrenamiento iniciado"}
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/entrenar/{task_id}")
+async def estado_entrenamiento(task_id: str):
+    """Obtiene el estado de un entrenamiento"""
+    status = manager.get_status(task_id)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    return {"success": True, "task": status}
+
+
+@app.get("/entrenar/historial")
+async def historial_entrenamiento():
+    """Obtiene historial de entrenamientos"""
+    tasks = manager.get_all_tasks()
+    return {"success": True, "tasks": tasks}
+
+
+@app.post("/modelo/recargar")
+async def recargar_modelo():
+    """Recarga el modelo desde disco (despues de entrenamiento)"""
+    global model, CLASS_NAMES
+    try:
+        model = None
+        CLASS_NAMES = load_classes()
+        load_model()
+        return {"success": True, "message": "Modelo recargado exitosamente", "clases": len(CLASS_NAMES)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Endpoint de prueba
 @app.post("/test")
