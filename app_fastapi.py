@@ -389,6 +389,95 @@ async def detector_status():
 
 
 # ═══════════════════════════════════════════════════════════════
+# ENDPOINTS — Detección de Enfermedades
+# ═══════════════════════════════════════════════════════════════
+
+class EnfermedadRequest(BaseModel):
+    animal_id: str
+    peso_actual_kg: float
+    peso_anterior_kg: float
+    dias_entre_pesajes: int
+    edad_dias: Optional[int] = None
+    temperatura_opcional: Optional[float] = None
+
+
+@app.post("/detectar-enfermedad")
+async def detectar_enfermedad(data: EnfermedadRequest):
+    """
+    Evalúa riesgo de enfermedad basado en cambios de peso y temperatura.
+    Reglas:
+      - Pérdida > 5% en 7 días → ALTO riesgo
+      - Pérdida > 3% en 7 días → MEDIO riesgo
+      - Sin ganancia en joven (<90 días) → MEDIO riesgo
+      - Normal → BAJO riesgo
+    """
+    try:
+        peso_actual = data.peso_actual_kg
+        peso_anterior = data.peso_anterior_kg
+        dias = data.dias_entre_pesajes
+        edad = data.edad_dias
+        temperatura = data.temperatura_opcional
+
+        factores = []
+        riesgo = "BAJO"
+        alerta = False
+        cambio_pct = None
+
+        if peso_anterior > 0 and dias > 0:
+            cambio_pct = ((peso_actual - peso_anterior) / peso_anterior) * 100
+            perdida_diaria = cambio_pct / dias if dias > 0 else 0
+
+            perdida_pct_7d = perdida_diaria * 7
+
+            if perdida_pct_7d < -5:
+                riesgo = "ALTO"
+                alerta = True
+                factores.append(f"Pérdida de peso severa: {cambio_pct:+.1f}% en {dias} días")
+            elif perdida_pct_7d < -3:
+                riesgo = "MEDIO"
+                factores.append(f"Pérdida de peso moderada: {cambio_pct:+.1f}% en {dias} días")
+            elif edad is not None and edad < 90 and cambio_pct <= 0:
+                riesgo = "MEDIO"
+                factores.append(f"Animal joven ({edad} días) sin ganancia de peso")
+            else:
+                factores.append(f"Peso estable o ganancia: {cambio_pct:+.1f}% en {dias} días")
+        else:
+            factores.append("Datos insuficientes para evaluar cambio de peso")
+
+        if temperatura is not None:
+            if temperatura >= 40:
+                riesgo = "ALTO"
+                alerta = True
+                factores.append(f"Fiebre detectada: {temperatura}°C")
+            elif temperatura >= 39.5:
+                if riesgo != "ALTO":
+                    riesgo = "MEDIO"
+                factores.append(f"Temperatura elevada: {temperatura}°C")
+            else:
+                factores.append(f"Temperatura normal: {temperatura}°C")
+
+        recomendaciones = {
+            "ALTO": "Aislar al animal, notificar al veterinario de inmediato, realizar revisión clínica completa, considerar tomar muestra para laboratorio.",
+            "MEDIO": "Monitorear cada 6 horas, registrar temperatura y peso diariamente, evaluar apetito y comportamiento, preparar plan de intervención.",
+            "BAJO": "Continuar monitoreo rutinario, mantener programa de alimentación y manejo sanitario habitual.",
+        }
+
+        return {
+            "success": True,
+            "animal_id": data.animal_id,
+            "riesgo": riesgo,
+            "factores": factores,
+            "recomendacion": recomendaciones.get(riesgo, ""),
+            "alerta": alerta,
+            "cambio_peso_pct": round(cambio_pct, 2) if peso_anterior > 0 and dias > 0 else None,
+        }
+
+    except Exception as e:
+        print(f"Error en detección de enfermedad: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════
 # ENDPOINTS — Dataset
 # ═══════════════════════════════════════════════════════════════
 
