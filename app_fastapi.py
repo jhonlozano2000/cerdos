@@ -16,44 +16,55 @@ import io
 import json
 import base64
 import shutil
+import threading
+import re
+import logging
 from datetime import datetime
+from time import time
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import tensorflow as tf
 from pathlib import Path
 from training_manager import manager
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from ultralytics import YOLO
+import utils
 
 
 # ── Configuración ────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
+utils.load_env()
+NEGATIVE_CLASS = utils.NEGATIVE_CLASS
+
+BASE_DIR = utils.BASE_DIR
 MODEL_PATH = BASE_DIR / "modelo_identificacion_cerdos.h5"
 MODELS_BACKUP_DIR = BASE_DIR / "model_backups"
 MAX_BACKUPS = 3
+IMG_SIZE = utils.IMG_SIZE
+THRESHOLD = utils.load_threshold()
 
-# Carga manual del .env (sin python-dotenv para evitar dependencias extras)
-_env_path = BASE_DIR / ".env"
-if _env_path.exists():
-    with open(_env_path) as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                if _k.strip() not in os.environ:
-                    os.environ[_k.strip()] = _v.strip()
-
-# Ruta al dataset — configurable via .env o variable de entorno
 DATASET_PATH = os.environ.get(
     "DATASET_PATH",
-    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\fotos_animales"
+    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\dataset\animales"
 )
-IMG_SIZE = (224, 224)
-THRESHOLD = 0.50  # Se sobreescribe desde classes.json si existe
+RECONOCIMIENTOS_PATH = os.environ.get(
+    "RECONOCIMIENTOS_PATH",
+    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\dataset\reconocimientos"
+)
 
 MODELS_BACKUP_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+
+# ── Cache de estadísticas ────────────────────────────────────────
+_stats_cache = {"data": None, "timestamp": 0}
+CACHE_TTL = 60
 
 
 # ── Funciones de Backup del Modelo ─────────────────────────────
@@ -113,43 +124,35 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://porci-integral-backend.test", "http://127.0.0.1:5173", "http://127.0.0.1:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Rate Limiting ───────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(429, _rate_limit_exceeded_handler)
+
+# ── API Key Auth ────────────────────────────────────────────────
+API_KEY = os.environ.get("API_KEY", "")
+
+async def verify_admin_key(x_api_key: str = Header(None)):
+    if not API_KEY:
+        return True  # No key configured = no auth
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="API Key inválida")
+    return True
+
 
 # ── Carga del Modelo y Utilidades ──────────────────────────────
 
-def load_classes():
-    """
-    Carga la lista de clases desde classes.json (autoritativo).
-    Si no existe, escanea DATASET_PATH como fallback.
-    """
-    classes_file = BASE_DIR / "classes.json"
-    if classes_file.exists():
-        with open(classes_file) as f:
-            data = json.load(f)
-        return data.get("classes", [])
-    if os.path.exists(DATASET_PATH):
-        classes = sorted([d for d in os.listdir(DATASET_PATH)
-                         if os.path.isdir(os.path.join(DATASET_PATH, d))])
-        return classes
-    return []
+CLASS_NAMES = utils.load_classes()
+THRESHOLD = utils.load_threshold()
+logger.info(f"Clases cargadas: {len(CLASS_NAMES)} - {CLASS_NAMES}")
 
-
-CLASS_NAMES = load_classes()
-
-# Sobreescribe THRESHOLD desde classes.json si está disponible
-_classes_file = BASE_DIR / "classes.json"
-if _classes_file.exists():
-    with open(_classes_file) as _f:
-        _data = json.load(_f)
-    if "threshold" in _data:
-        THRESHOLD = _data["threshold"]
-print(f"Clases cargadas: {len(CLASS_NAMES)} - {CLASS_NAMES}")
-
+model_lock = threading.Lock()
 model = None
 
 
@@ -160,38 +163,43 @@ def load_model():
     """
     global model
     if model is None:
-        if os.path.exists(MODEL_PATH):
-            print(f"Cargando modelo desde: {MODEL_PATH}")
-            model = tf.keras.models.load_model(MODEL_PATH)
-            print("Modelo cargado exitosamente")
-        else:
-            print(f"Modelo no encontrado en: {MODEL_PATH}")
+        with model_lock:
+            if model is None:  # Double-checked locking
+                if os.path.exists(MODEL_PATH):
+                    logger.info(f"Cargando modelo desde: {MODEL_PATH}")
+                    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+                    logger.info("Modelo cargado exitosamente")
+                else:
+                    logger.warning(f"Modelo no encontrado en: {MODEL_PATH}")
 
 
 def preprocess_image(image_bytes):
-    """
-    Convierte bytes de imagen a un array numpy normalizado
-    listo para la inferencia de MobileNetV2.
-    """
-    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    img = img.resize(IMG_SIZE)
-    img_array = np.array(img, dtype=np.float32)
-    img_array = img_array / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array
+    return utils.preprocess_image(image_bytes)
 
 
-def predict_top3(image_bytes):
+def predict_top3(image_bytes, use_tta=True):
     """
-    Ejecuta inferencia y retorna las 3 clases con mayor probabilidad.
-    Las predicciones por debajo de THRESHOLD se marcan como "Desconocido".
+    Ejecuta inferencia con Test-Time Augmentation y retorna las 3 clases
+    con mayor probabilidad. Las predicciones por debajo de THRESHOLD
+    se marcan como "Desconocido".
     """
     load_model()
     if model is None:
         raise HTTPException(status_code=500, detail="Modelo no cargado")
 
-    img_array = preprocess_image(image_bytes)
-    predictions = model.predict(img_array, verbose=0)[0]
+    if use_tta:
+        tta_inputs = utils.preprocess_image_tta(image_bytes)
+        all_preds = []
+        for aug_array, _label in tta_inputs:
+            with model_lock:
+                preds = model.predict(aug_array, verbose=0)[0]
+            all_preds.append(preds)
+        avg_preds = np.mean(all_preds, axis=0)
+        predictions = avg_preds
+    else:
+        img_array = preprocess_image(image_bytes)
+        with model_lock:
+            predictions = model.predict(img_array, verbose=0)[0]
 
     top_indices = np.argsort(predictions)[::-1][:3]
 
@@ -199,13 +207,17 @@ def predict_top3(image_bytes):
     for idx in top_indices:
         confidence = float(predictions[idx])
         is_unknown = confidence < THRESHOLD
+        class_name = CLASS_NAMES[idx] if 0 <= idx < len(CLASS_NAMES) else f"clase_{idx}"
+
+        is_no_cerdo = class_name.lower() == NEGATIVE_CLASS.lower()
+        display_name = "Desconocido" if (is_unknown or is_no_cerdo) else class_name
 
         results.append({
             "class_id": int(idx),
-            "class_name": CLASS_NAMES[idx] if not is_unknown else "Desconocido",
+            "class_name": display_name,
             "confidence": confidence,
             "confidence_pct": f"{confidence * 100:.1f}%",
-            "is_unknown": is_unknown
+            "is_unknown": is_unknown or is_no_cerdo
         })
 
     return results
@@ -214,6 +226,16 @@ def predict_top3(image_bytes):
 # ═══════════════════════════════════════════════════════════════
 # ENDPOINTS — Reconocimiento
 # ═══════════════════════════════════════════════════════════════
+
+@app.on_event("startup")
+def _precargar_modelo():
+    """Precarga modelo y clases al iniciar el servicio."""
+    if MODEL_PATH.exists():
+        load_model()
+        logger.info(f"Modelo precargado desde: {MODEL_PATH}")
+    else:
+        logger.warning(f"Modelo no encontrado en startup: {MODEL_PATH}")
+
 
 @app.get("/")
 def root():
@@ -225,17 +247,32 @@ def root():
     }
 
 
+@app.get("/ready")
+def ready():
+    """Healthcheck readiness — intenta cargar el modelo si no lo está."""
+    load_model()
+    if model is None:
+        raise HTTPException(status_code=503, detail="Modelo no cargado")
+    return {"status": "ready", "modelo_cargado": True}
+
+
 @app.get("/salud")
 def salud():
     """Estado completo del servicio: modelo, dataset, clases."""
+    load_model()
     return {
         "status": "ok",
         "modelo_cargado": model is not None,
         "modelo_existe": MODEL_PATH.exists(),
+        "modelo_ruta": str(MODEL_PATH),
         "dataset_path": DATASET_PATH,
         "dataset_existe": os.path.isdir(DATASET_PATH),
         "clases_disponibles": len(CLASS_NAMES),
+        "clases": CLASS_NAMES,
+        "threshold": THRESHOLD,
         "version": "1.0.0",
+        "rate_limiting": "activo",
+        "api_key_configured": bool(API_KEY),
     }
 
 
@@ -250,7 +287,8 @@ def get_clases():
 
 
 @app.post("/reconocer")
-async def reconocer(file: UploadFile = File(...)):
+@limiter.limit("60/minute")
+async def reconocer(request: Request, file: UploadFile = File(...)):
     """
     Reconoce una cerda a partir de una imagen subida.
     Acepta: image/jpeg, image/png, image/webp (máx 10MB).
@@ -273,25 +311,36 @@ async def reconocer(file: UploadFile = File(...)):
             "confianza_top1": results[0]["confidence_pct"] if results else None
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error en reconocimiento: {str(e)}")
+        logger.error(f"Error en reconocimiento: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/reconocer_base64")
-async def reconocer_base64(data: dict):
+@limiter.limit("60/minute")
+async def reconocer_base64(request: Request, data: dict):
     """
     Reconoce una cerda a partir de una imagen en base64.
     Útil para integración con cámaras o dispositivos IoT.
     """
     try:
         image_data = data.get("imagen", "")
+        if not isinstance(image_data, str) or not image_data:
+            raise HTTPException(status_code=400, detail="Campo 'imagen' requerido")
 
         # Remueve el prefijo data:image/...;base64, si existe
         if "," in image_data:
             image_data = image_data.split(",")[1]
 
-        image_bytes = base64.b64decode(image_data)
+        try:
+            image_bytes = base64.b64decode(image_data)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Base64 inválido")
+
+        if len(image_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Imagen muy grande (máx 10MB)")
 
         results = predict_top3(image_bytes)
 
@@ -302,8 +351,64 @@ async def reconocer_base64(data: dict):
             "confianza_top1": results[0]["confidence_pct"] if results else None
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error en reconocimiento: {str(e)}")
+        logger.error(f"Error en reconocimiento: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ReconocerCompletoRequest(BaseModel):
+    imagen: str
+    incluir_deteccion: bool = True
+
+
+@app.post("/reconocer-completo")
+@limiter.limit("60/minute")
+async def reconocer_completo(request: Request, data: ReconocerCompletoRequest):
+    """Combina YOLO detection + MobileNetV2 classification in one call."""
+    try:
+        image_data = data.imagen
+        if "," in image_data:
+            image_data = image_data.split(",")[1]
+        image_bytes = base64.b64decode(image_data)
+
+        # MobileNetV2 classification
+        tf_results = predict_top3(image_bytes)
+        top1 = tf_results[0]["class_name"] if tf_results else "Desconocido"
+
+        result = {
+            "success": True,
+            "tensorflow_predictions": tf_results,
+            "identified_as": top1,
+            "confidence_top1": tf_results[0]["confidence_pct"] if tf_results else "0%",
+            "yolo_detections": [],
+            "total_detections": 0,
+        }
+
+        # YOLO detection if requested
+        if data.incluir_deteccion:
+            try:
+                yolo = load_yolo()
+                img = Image.open(io.BytesIO(image_bytes))
+                yolo_results = yolo(img, conf=0.25, verbose=False)
+                detections = []
+                for r in yolo_results:
+                    boxes = r.boxes
+                    for box in boxes:
+                        detections.append({
+                            "clase": yolo.model.names[int(box.cls[0])],
+                            "confianza": round(float(box.conf[0]) * 100),
+                            "bbox": box.xyxy[0].tolist()
+                        })
+                result["yolo_detections"] = detections
+                result["total_detections"] = len(detections)
+            except Exception as yolo_err:
+                logger.warning(f"YOLO detection error (non-fatal): {yolo_err}")
+
+        return result
+    except Exception as e:
+        logger.error(f"Error en reconocer-completo: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -312,6 +417,8 @@ class ConfirmacionRequest(BaseModel):
     confidence: float
     animal_id: Optional[int] = None
     foto_base64: Optional[str] = None
+    clase_confirmada: Optional[str] = None
+    usuario_id: Optional[int] = None
 
 
 @app.post("/confirmar")
@@ -320,20 +427,66 @@ async def confirmar(data: ConfirmacionRequest):
     Registra la confirmación del usuario sobre una predicción.
     Se usa para retroalimentación y mejora del modelo.
     """
-    print(f"Confirmación recibida: {data.class_name} - {data.confidence}")
+    try:
+        clase_confirmada = data.clase_confirmada or data.class_name
 
-    return {
-        "success": True,
-        "message": "Confirmación registrada",
-        "data": data.dict()
-    }
+        # Persist confirmation to log
+        confirm_log_path = BASE_DIR / "confirmaciones_log.jsonl"
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "clase_predicha": data.class_name,
+            "clase_confirmada": clase_confirmada,
+            "confidence": data.confidence,
+            "animal_id": data.animal_id,
+            "usuario_id": data.usuario_id,
+        }
+        with open(confirm_log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
 
+        # Save image to dataset if provided
+        if data.foto_base64:
+            try:
+                image_data = data.foto_base64
+                if "," in image_data:
+                    image_data = image_data.split(",")[1]
+                image_bytes = base64.b64decode(image_data)
 
+                class_dir = os.path.join(RECONOCIMIENTOS_PATH, clase_confirmada)
+                os.makedirs(class_dir, exist_ok=True)
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                uuid_str = base64.urlsafe_b64encode(os.urandom(6)).decode().rstrip("=")
+                filename = f"confirm_{timestamp}_{uuid_str}.jpg"
+                filepath = os.path.join(class_dir, filename)
+
+                with open(filepath, "wb") as f:
+                    f.write(image_bytes)
+
+                entry["imagen_guardada"] = filename
+            except Exception as img_err:
+                logger.error(f"Error guardando imagen de confirmacion: {img_err}")
+
+        # Count confirmations to trigger retrain if enough
+        try:
+            with open(confirm_log_path) as _cl:
+            total_confirmaciones = sum(1 for _ in _cl)
+            entry["total_confirmaciones"] = total_confirmaciones
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "message": "Confirmación registrada",
+            "data": entry
+        }
+    except Exception as e:
+        logger.error(f"Error en confirmar: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+ 
 # ═══════════════════════════════════════════════════════════════
 # ENDPOINTS — YOLOv8 (Detección de objetos)
 # ═══════════════════════════════════════════════════════════════
-
-from ultralytics import YOLO
 
 # Busca automáticamente el peso YOLO en distintas ubicaciones posibles
 yolo_model_paths = [
@@ -350,7 +503,7 @@ def load_yolo():
     global yolo_model
     if yolo_model is None:
         yolo_model = YOLO(YOLO_MODEL_PATH)
-        print(f"YOLO cargado: {yolo_model.model.names}")
+        logger.info(f"YOLO cargado: {yolo_model.model.names}")
     return yolo_model
 
 
@@ -361,19 +514,22 @@ async def detectar(file: UploadFile = File(...)):
     Retorna bounding boxes, clase y confianza por detección.
     """
     try:
-        model = load_yolo()
+        if file.content_type not in ["image/jpeg", "image/png", "image/webp"]:
+            raise HTTPException(status_code=400, detail="Tipo de imagen no válido")
+
+        yolo = load_yolo()
 
         image_bytes = await file.read()
         img = Image.open(io.BytesIO(image_bytes))
 
-        results = model(img, conf=0.25, verbose=False)
+        results = yolo(img, conf=0.25, verbose=False)
 
         deteccions = []
         for r in results:
             boxes = r.boxes
             for box in boxes:
                 deteccions.append({
-                    "clase": model.model.names[int(box.cls[0])],
+                    "clase": yolo.model.names[int(box.cls[0])],
                     "confianza": round(float(box.conf[0]) * 100),
                     "bbox": box.xyxy[0].tolist()
                 })
@@ -384,19 +540,21 @@ async def detectar(file: UploadFile = File(...)):
             "resultados": deteccions
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error detección: {e}")
+        logger.error(f"Error en detección: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/detector/status")
 async def detector_status():
     """Estado y configuración del detector YOLO."""
-    model = load_yolo()
+    yolo = load_yolo()
     return {
         "success": True,
         "modelo": "YOLOv8",
-        "clases": model.model.names,
+        "clases": yolo.model.names,
         "peso": YOLO_MODEL_PATH
     }
 
@@ -486,7 +644,7 @@ async def detectar_enfermedad(data: EnfermedadRequest):
         }
 
     except Exception as e:
-        print(f"Error en detección de enfermedad: {e}")
+        logger.error(f"Error en detección de enfermedad: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -500,7 +658,8 @@ class ExportarFotoRequest(BaseModel):
 
 
 @app.post("/exportar-foto")
-async def exportar_foto(data: ExportarFotoRequest):
+@limiter.limit("10/minute")
+async def exportar_foto(request: Request, data: ExportarFotoRequest, auth: bool = Depends(verify_admin_key)):
     """
     Guarda una foto directamente en el dataset de entrenamiento.
     Ruta final: {DATASET_PATH}/{class_name}/foto.jpg
@@ -509,6 +668,8 @@ async def exportar_foto(data: ExportarFotoRequest):
         class_name = data.class_name.strip()
         if not class_name:
             raise HTTPException(status_code=400, detail="class_name es requerido")
+        if not re.match(r'^[a-zA-Z0-9_\-]+$', class_name):
+            raise HTTPException(status_code=400, detail="class_name contiene caracteres inválidos")
 
         class_dir = os.path.join(DATASET_PATH, class_name)
         os.makedirs(class_dir, exist_ok=True)
@@ -526,6 +687,8 @@ async def exportar_foto(data: ExportarFotoRequest):
             f.write(image_bytes)
 
         return {"success": True, "filename": filename, "class_name": class_name}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -537,9 +700,16 @@ async def dataset_estadisticas():
     - Lista de clases con conteo de imágenes
     - Total global de imágenes y clases
     """
+    global _stats_cache
+    now = time()
+    if _stats_cache["data"] is not None and (now - _stats_cache["timestamp"]) < CACHE_TTL:
+        return _stats_cache["data"]
+
     try:
         if not os.path.exists(DATASET_PATH):
-            return {"clases": [], "total_global": 0, "total_clases": 0}
+            data = {"clases": [], "total_global": 0, "total_clases": 0}
+            _stats_cache = {"data": data, "timestamp": now}
+            return data
 
         clases = []
         total_global = 0
@@ -551,11 +721,13 @@ async def dataset_estadisticas():
                 clases.append({"nombre": d, "total": count})
                 total_global += count
 
-        return {
+        data = {
             "clases": clases,
             "total_global": total_global,
             "total_clases": len(clases),
         }
+        _stats_cache = {"data": data, "timestamp": now}
+        return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -570,7 +742,8 @@ class EntrenarRequest(BaseModel):
 
 
 @app.post("/entrenar")
-async def iniciar_entrenamiento(data: EntrenarRequest = None):
+@limiter.limit("10/minute")
+async def iniciar_entrenamiento(request: Request, data: EntrenarRequest = None, auth: bool = Depends(verify_admin_key)):
     """
     Inicia entrenamiento asíncrono del modelo MobileNetV2.
     - Crea backup automático del modelo actual
@@ -612,16 +785,19 @@ async def historial_entrenamiento():
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/modelo/recargar")
-async def recargar_modelo():
+@limiter.limit("10/minute")
+async def recargar_modelo(request: Request, auth: bool = Depends(verify_admin_key)):
     """
     Recarga el modelo desde disco.
     Útil después de un entrenamiento para usar el nuevo modelo sin reiniciar el servicio.
     """
-    global model, CLASS_NAMES
+    global model, CLASS_NAMES, THRESHOLD
     try:
-        model = None
-        CLASS_NAMES = load_classes()
-        load_model()
+        with model_lock:
+            model = None
+            CLASS_NAMES = load_classes()
+            _reload_threshold()
+            load_model()
         return {"success": True, "message": "Modelo recargado exitosamente", "clases": len(CLASS_NAMES)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -642,7 +818,8 @@ class RestaurarRequest(BaseModel):
 
 
 @app.post("/modelo/restaurar")
-async def modelo_restaurar(data: RestaurarRequest):
+@limiter.limit("10/minute")
+async def modelo_restaurar(request: Request, data: RestaurarRequest, auth: bool = Depends(verify_admin_key)):
     """
     Restaura un modelo desde un backup existente.
     - Crea backup del modelo actual antes de restaurar
@@ -661,9 +838,10 @@ async def modelo_restaurar(data: RestaurarRequest):
         if classes_file.exists():
             shutil.copy2(str(classes_file), str(BASE_DIR / "classes.json"))
 
-        model = None
-        CLASS_NAMES = load_classes()
-        load_model()
+        with model_lock:
+            model = None
+            CLASS_NAMES = load_classes()
+            load_model()
 
         return {
             "success": True,

@@ -1,5 +1,6 @@
 {
   "classes": [
+    "Reproductor",
     "cerda_001",
     "cerda_002",
     "cerda_003",
@@ -12,25 +13,29 @@
     "cerda_010",
     "cerda_011",
     "cerda_012",
-    "no_cerdo",
-    "reproductor"
+    "no_cerdo"
   ],
   "num_classes": 14,
-  "threshold": 0.6,
+  "threshold": 0.2,
   "model_input_size": [
     224,
     224
   ],
   "version": "2.0",
   "training_info": {
-    "total_train_images": 10137,
-    "total_val_images": 2527,
-    "best_val_accuracy_phase1": 0.8246933221817017,
-    "best_val_accuracy_phase2": 0.841709554195404,
-    "epochs_phase1": 15,
-    "epochs_phase2": 20,
+    "total_train_images": 1293,
+    "total_val_images": 398,
+    "best_val_accuracy_phase1": 0.8065326809883118,
+    "best_val_accuracy_phase2": 0.7412060499191284,
+    "epochs_phase1": 60,
+    "epochs_phase2": 80,
     "augmentation": true,
     "class_weights": true,
-    "fine_tuning": true
+    "fine_tuning": true,
+    "oversampling_min": 80,
+    "max_no_cerdo": 80,
+    "unfreeze_layers": 8,
+    "mixup": true,
+    "mixup_alpha": 0.2
   }
 }

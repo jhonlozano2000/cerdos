@@ -16,6 +16,8 @@ import json
 import os
 import sys
 import time
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from pathlib import Path
 
@@ -23,54 +25,61 @@ import cv2
 import numpy as np
 import tensorflow as tf
 from ultralytics import YOLO
+import utils
 
 
-BASE_DIR = Path(__file__).resolve().parent
+utils.load_env()
+NEGATIVE_CLASS = utils.NEGATIVE_CLASS
+BASE_DIR = utils.BASE_DIR
 MODEL_PATH = BASE_DIR / "modelo_identificacion_cerdos.h5"
 CLASSES_PATH = BASE_DIR / "classes.json"
 LOG_PATH = BASE_DIR / "cctv_log.jsonl"
-YOLO_MODEL_PATH = BASE_DIR / "yolov8n.pt"
+YOLO_MODEL_PATH = BASE_DIR / "runs" / "detect" / "output" / "yolo_detector" / "train" / "weights" / "best.pt"
+YOLO_IS_CUSTOM = YOLO_MODEL_PATH.exists()
+if not YOLO_IS_CUSTOM:
+    YOLO_MODEL_PATH = BASE_DIR / "yolov8n.pt"
+    logger.warning("Usando YOLO COCO (yolov8n.pt) — no tiene clase 'cerdo'. "
+                   "Entrena YOLO custom para detección precisa.")
 
-IMG_SIZE = (224, 224)
-THRESHOLD = 0.50
+handler = RotatingFileHandler(BASE_DIR / "logs" / "cctv.log", maxBytes=100 * 1024 * 1024, backupCount=3)
+handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[handler, logging.StreamHandler()])
+logger = logging.getLogger(__name__)
+
+IMG_SIZE = utils.IMG_SIZE
+THRESHOLD = utils.load_threshold()
 YOLO_CONF = 0.25
 TARGET_FPS = 5
 FRAME_INTERVAL = 1.0 / TARGET_FPS
+FRAME_SKIP = 3  # Ejecutar YOLO cada N frames
 
 
-def load_classes():
-    if CLASSES_PATH.exists():
-        with open(CLASSES_PATH) as f:
-            data = json.load(f)
-            return data.get("classes", [])
-    return []
-
-
-CLASS_NAMES = load_classes()
-print(f"Clases cargadas: {len(CLASS_NAMES)} - {CLASS_NAMES}")
+CLASS_NAMES = utils.load_classes()
+logger.info(f"Clases cargadas: {len(CLASS_NAMES)} - {CLASS_NAMES}")
 
 
 def load_models():
-    print("Cargando YOLOv8...")
+    logger.info("Cargando YOLOv8...")
     yolo = YOLO(str(YOLO_MODEL_PATH))
 
-    print("Cargando MobileNetV2 (identificación)...")
+    logger.info("Cargando MobileNetV2 (identificación)...")
     if MODEL_PATH.exists():
-        model = tf.keras.models.load_model(str(MODEL_PATH))
-        print("Modelo de identificación cargado")
+        model = tf.keras.models.load_model(str(MODEL_PATH), compile=False)
+        logger.info("Modelo de identificación cargado")
     else:
-        print(f"Modelo no encontrado en {MODEL_PATH}, identificación deshabilitada")
+        logger.warning(f"Modelo no encontrado en {MODEL_PATH}, identificación deshabilitada")
         model = None
 
     return yolo, model
 
 
 def preprocess_image(roi):
-    img = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, IMG_SIZE)
-    img_array = np.array(img, dtype=np.float32) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array
+    if len(roi.shape) != 3:
+        roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+    img_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+    img_rgb = cv2.resize(img_rgb, IMG_SIZE, interpolation=cv2.INTER_LINEAR)
+    img_array = np.array(img_rgb, dtype=np.float32) / 255.0
+    return np.expand_dims(img_array, axis=0)
 
 
 def identify_pig(model, roi):
@@ -86,6 +95,8 @@ def identify_pig(model, roi):
         return "Desconocido", confidence
 
     class_name = CLASS_NAMES[top_idx] if top_idx < len(CLASS_NAMES) else f"ID_{top_idx}"
+    if class_name.lower() == NEGATIVE_CLASS.lower():
+        return "Desconocido", confidence
     return class_name, confidence
 
 
@@ -135,7 +146,7 @@ def main():
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
-        print(f"Error: No se pudo abrir la fuente: {args.source}")
+        logger.error(f"No se pudo abrir la fuente: {args.source}")
         sys.exit(1)
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
@@ -149,20 +160,30 @@ def main():
     frame_num = 0
     prev_time = time.time()
     fps = 0.0
+    frame_counter = 0
+    last_detections = []
 
-    print(f"\nIniciando monitoreo desde: {args.source}")
-    print("Controles: [q] Salir  [p] Pausar  [s] Guardar frame\n")
+    logger.info(f"Iniciando monitoreo desde: {args.source}")
+    logger.info("Controles: [q] Salir  [p] Pausar  [s] Guardar frame")
 
     while True:
         if not paused:
             ret, frame = cap.read()
             if not ret:
-                print("Error al leer frame — reconectando...")
+                logger.warning("Error al leer frame — reconectando...")
                 cap.release()
-                time.sleep(2)
-                cap = cv2.VideoCapture(source)
-                if not cap.isOpened():
-                    print("Error crítico: No se pudo reconectar")
+                max_retries = 10
+                for attempt in range(max_retries):
+                    time.sleep(min(2 ** attempt, 30))
+                    cap = cv2.VideoCapture(source)
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    if cap.isOpened():
+                        logger.info(f"Reconectado exitosamente (intento {attempt + 1})")
+                        break
+                    logger.warning(f"Reintento {attempt + 1}/{max_retries}...")
+                else:
+                    logger.error("No se pudo reconectar tras 10 intentos")
                     break
                 continue
 
@@ -172,24 +193,31 @@ def main():
             prev_time = current_time
             fps = 0.9 * fps + 0.1 * (1.0 / elapsed) if elapsed > 0 else 0
 
-            results = yolo(frame, conf=YOLO_CONF, verbose=False)
-            detections = []
-            for r in results:
-                boxes = r.boxes
-                for box in boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                    conf = float(box.conf[0])
+            frame_counter += 1
 
-                    roi = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
-                    if roi.size == 0:
-                        continue
+            # YOLO cada FRAME_SKIP frames; usar última detección entre medio
+            if frame_counter % FRAME_SKIP == 0:
+                results = yolo(frame, conf=YOLO_CONF, verbose=False)
+                last_detections = []
+                for r in results:
+                    boxes = r.boxes
+                    for box in boxes:
+                        cls_id = int(box.cls[0])
+                        if YOLO_IS_CUSTOM and cls_id != 0:
+                            continue
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        conf = float(box.conf[0])
 
-                    animal_id, id_conf = identify_pig(id_model, roi)
-                    detections.append((x1, y1, x2, y2, conf, animal_id, id_conf))
+                        roi = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+                        if roi.size == 0:
+                            continue
 
-                    log_detection(animal_id, id_conf, (x1, y1, x2, y2), frame_num)
+                        animal_id, id_conf = identify_pig(id_model, roi)
+                        last_detections.append((x1, y1, x2, y2, conf, animal_id, id_conf))
 
-            for x1, y1, x2, y2, det_conf, animal_id, id_conf in detections:
+                        log_detection(animal_id, id_conf, (x1, y1, x2, y2), frame_num)
+
+            for x1, y1, x2, y2, det_conf, animal_id, id_conf in last_detections:
                 if animal_id == "Desconocido":
                     color = (0, 165, 255)
                 else:
@@ -202,22 +230,25 @@ def main():
                 cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 6, y1), color, -1)
                 cv2.putText(frame, label, (x1 + 3, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
-            frame = draw_info(frame, len(detections), fps, paused)
+            frame = draw_info(frame, len(last_detections), fps, paused)
 
         cv2.imshow(window_name, frame)
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord("q"):
-            print("Finalizando monitoreo...")
+            logger.info("Finalizando monitoreo...")
             break
         elif key == ord("p"):
             paused = not paused
-            print(f"{'Pausado' if paused else 'Reanudado'}")
+            logger.info(f"{'Pausado' if paused else 'Reanudado'}")
+            if not paused:
+                prev_time = time.time()
+                current_time = prev_time
         elif key == ord("s"):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = BASE_DIR / f"captura_{timestamp}.jpg"
             cv2.imwrite(str(filename), frame)
-            print(f"Frame guardado: {filename}")
+            logger.info(f"Frame guardado: {filename}")
 
         if not paused:
             sleep_time = FRAME_INTERVAL - (time.time() - current_time)
@@ -226,8 +257,8 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
-    print(f"Log guardado en: {LOG_PATH}")
-    print(f"Total frames procesados: {frame_num}")
+    logger.info(f"Log guardado en: {LOG_PATH}")
+    logger.info(f"Total frames procesados: {frame_num}")
 
 
 if __name__ == "__main__":

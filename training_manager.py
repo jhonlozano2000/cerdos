@@ -174,7 +174,7 @@ class TrainingManager:
                 cmd,
                 cwd=str(BASE_DIR),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
             )
@@ -200,6 +200,21 @@ class TrainingManager:
                         pass
 
             return_code = process.wait()
+
+            # Capture stderr
+            _stderr_output = process.stderr.read() or ""
+
+            # Log stderr to file if there was an error
+            if return_code != 0 and _stderr_output.strip():
+                logs_dir = TASKS_DIR.parent / "logs"
+                logs_dir.mkdir(exist_ok=True)
+                log_file = logs_dir / f"train_{task_id}_error.log"
+                with open(log_file, "w") as f:
+                    f.write(f"Training task {task_id} failed with code {return_code}\n")
+                    f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+                    f.write("=" * 50 + "\n")
+                    f.write(_stderr_output)
+
             if return_code == 0 and not self._is_cancelled(task_id):
                 final = self._load_progress(task_dir)
                 acc = final.get("best_val_accuracy", 0) if final else 0
