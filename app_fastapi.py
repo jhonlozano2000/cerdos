@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import tensorflow as tf
 from pathlib import Path
-from training_manager import manager
+from training_manager import manager, TASKS_DIR
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from ultralytics import YOLO
@@ -49,11 +49,11 @@ THRESHOLD = utils.load_threshold()
 
 DATASET_PATH = os.environ.get(
     "DATASET_PATH",
-    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\dataset\animales"
+    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\datasets\animales"
 )
 RECONOCIMIENTOS_PATH = os.environ.get(
     "RECONOCIMIENTOS_PATH",
-    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\dataset\reconocimientos"
+    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\datasets\reconocimientos"
 )
 
 MODELS_BACKUP_DIR.mkdir(exist_ok=True)
@@ -469,8 +469,8 @@ async def confirmar(data: ConfirmacionRequest):
         # Count confirmations to trigger retrain if enough
         try:
             with open(confirm_log_path) as _cl:
-            total_confirmaciones = sum(1 for _ in _cl)
-            entry["total_confirmaciones"] = total_confirmaciones
+                total_confirmaciones = sum(1 for _ in _cl)
+                entry["total_confirmaciones"] = total_confirmaciones
         except Exception:
             pass
 
@@ -732,6 +732,48 @@ async def dataset_estadisticas():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/training-stats")
+async def training_stats():
+    """
+    Retorna estadísticas para el pipeline de reentrenamiento:
+    - Total de fotos en la carpeta fuente (imagenes_originales)
+    - Conteo por clase
+    """
+    try:
+        source_path = r"D:\cerdos\imagenes_originales"
+        if not os.path.exists(source_path):
+            return {
+                "source_path": source_path,
+                "total_source_photos": 0,
+                "classes": [],
+                "error": None
+            }
+
+        classes_data = []
+        total = 0
+        for d in sorted(os.listdir(source_path)):
+            dir_path = os.path.join(source_path, d)
+            if os.path.isdir(dir_path):
+                count = len([f for f in os.listdir(dir_path)
+                           if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))])
+                classes_data.append({"class": d, "count": count})
+                total += count
+
+        return {
+            "source_path": source_path,
+            "total_source_photos": total,
+            "classes": classes_data,
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "source_path": None,
+            "total_source_photos": 0,
+            "classes": [],
+            "error": str(e)
+        }
+
+
 # ═══════════════════════════════════════════════════════════════
 # ENDPOINTS — Entrenamiento
 # ═══════════════════════════════════════════════════════════════
@@ -739,6 +781,30 @@ async def dataset_estadisticas():
 class EntrenarRequest(BaseModel):
     include_classes: Optional[List[str]] = None
     exclude_classes: Optional[List[str]] = None
+    config: Optional[dict] = None
+
+
+@app.get("/ml/training-config")
+async def training_config():
+    """
+    Retorna la configuración por defecto del script de entrenamiento.
+    Usada por el frontend para llenar el panel de configuración avanzada.
+    """
+    return {
+        "batch_size": 16,
+        "epochs_frozen": 60,
+        "epochs_finetune": 80,
+        "lr": 0.0001,
+        "finetune_lr": 0.000001,
+        "max_images_per_class": 200,
+        "max_no_cerdo": 80,
+        "unfreeze_layers": 8,
+        "disable_mixup": False,
+        "mixup_alpha": 0.2,
+        "oversample_min": 80,
+        "focal_gamma": 1.5,
+        "disable_class_weights": False,
+    }
 
 
 @app.post("/entrenar")
@@ -749,19 +815,28 @@ async def iniciar_entrenamiento(request: Request, data: EntrenarRequest = None, 
     - Crea backup automático del modelo actual
     - Delega a training_manager que corre en un thread separado
     - Opcional: include_classes para entrenar solo clases específicas
+    - Opcional: config con hiperparámetros avanzados
     """
     try:
         backup_current_model()
 
         include = data.include_classes if data else None
         exclude = data.exclude_classes if data else None
+        config = data.config if data else None
 
-        task_id = manager.start_training(include_classes=include, exclude_classes=exclude)
+        task_id = manager.start_training(include_classes=include, exclude_classes=exclude, config=config)
         return {"success": True, "task_id": task_id, "message": "Entrenamiento iniciado"}
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/entrenar/historial")
+async def historial_entrenamiento():
+    """Historial completo de entrenamientos realizados."""
+    tasks = manager.get_all_tasks()
+    return {"success": True, "tasks": tasks}
 
 
 @app.get("/entrenar/{task_id}")
@@ -770,14 +845,52 @@ async def estado_entrenamiento(task_id: str):
     status = manager.get_status(task_id)
     if status.get("status") == "not_found":
         raise HTTPException(status_code=404, detail="Tarea no encontrada")
+
+    # Calcular elapsed_seconds si started_at está presente
+    started_at = status.get("started_at")
+    if started_at:
+        try:
+            start_dt = datetime.fromisoformat(started_at)
+            elapsed = (datetime.now() - start_dt).total_seconds()
+            status["elapsed_seconds"] = int(elapsed)
+        except Exception:
+            pass
+
     return {"success": True, "task": status}
 
 
-@app.get("/entrenar/historial")
-async def historial_entrenamiento():
-    """Historial completo de entrenamientos realizados."""
-    tasks = manager.get_all_tasks()
-    return {"success": True, "tasks": tasks}
+@app.get("/entrenar/{task_id}/log")
+async def obtener_log_entrenamiento(task_id: str):
+    """Retorna el log de error completo de una tarea de entrenamiento."""
+    logs_dir = BASE_DIR / "logs"
+    log_path = logs_dir / f"train_{task_id}_error.log"
+    if not log_path.exists():
+        raise HTTPException(status_code=404, detail="Log no disponible")
+    return {"success": True, "log": log_path.read_text(encoding="utf-8")}
+
+
+@app.get("/entrenar/{task_id}/history")
+async def obtener_history_entrenamiento(task_id: str):
+    """Retorna el historial de métricas por época (phase1 + phase2)."""
+    task_dir = TASKS_DIR / task_id
+    if not task_dir.exists():
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    history = {}
+    for phase_file in ["history_phase1.json", "history_phase2.json"]:
+        path = task_dir / phase_file
+        if path.exists():
+            phase = phase_file.replace("history_", "").replace(".json", "")
+            history[phase] = json.loads(path.read_text(encoding="utf-8"))
+    return {"success": True, "history": history}
+
+
+@app.post("/entrenar/{task_id}/cancel")
+async def cancelar_entrenamiento(task_id: str, auth: bool = Depends(verify_admin_key)):
+    """Cancela una tarea de entrenamiento en ejecución."""
+    ok = manager.cancel_training(task_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="No se puede cancelar la tarea (no encontrada o ya finalizada)")
+    return {"success": True, "message": "Entrenamiento cancelado"}
 
 
 # ═══════════════════════════════════════════════════════════════

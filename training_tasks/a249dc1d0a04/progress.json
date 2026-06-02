@@ -1,0 +1,27 @@
+{
+    "task_id":  "a249dc1d0a04",
+    "status":  "error",
+    "phase":  "frozen",
+    "current_epoch":  5,
+    "total_epochs":  60,
+    "current_accuracy":  0.28551530838012695,
+    "best_val_accuracy":  0.5339366793632507,
+    "current_loss":  0.45763450860977173,
+    "current_val_accuracy":  0.5339366793632507,
+    "current_val_loss":  0.23635882139205933,
+    "progress_pct":  4,
+    "message":  "Interrumpido por reinicio del servicio",
+    "classes_found":  [
+                          "Reproductor-Seuz",
+                          "cerda_001",
+                          "cerda_002",
+                          "cerda_003",
+                          "cerda_004",
+                          "cerda_005",
+                          "cerda_006"
+                      ],
+    "started_at":  "2026-06-02T00:45:15.890534",
+    "finished_at":  "2026-06-02T02:25:59.700707",
+    "elapsed_seconds":  252,
+    "lr_actual":  9.9999997473787516E-05
+}

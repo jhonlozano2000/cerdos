@@ -59,8 +59,9 @@ uvicorn app_fastapi:app --host 0.0.0.0 --port 8000
 | Endpoint                  | Método | Descripción                          |
 | ------------------------- | ------ | ------------------------------------ |
 | `/entrenar`               | POST   | Iniciar entrenamiento async          |
-| `/entrenar/{task_id}`     | GET    | Estado del entrenamiento             |
 | `/entrenar/historial`     | GET    | Historial de entrenamientos          |
+| `/entrenar/{task_id}`     | GET    | Estado del entrenamiento             |
+| `/entrenar/activo`        | GET    | Entrenamiento activo (si existe)     |
 
 ### Modelo
 | Endpoint                  | Método | Descripción                          |
@@ -121,6 +122,7 @@ Antes de cada entrenamiento se crea un backup. Máximo 3 versiones.
 ### Gestión de tareas
 - Persisten en disco (`training_tasks/tasks_index.json`)
 - Tareas "running" al reiniciar pasan a "error"
+- `get_status()` recupera progreso desde disco si la tarea fue interrumpida por reinicio pero el subproceso sigue activo
 - Limpieza automática (máximo 15 tareas completadas)
 
 ## Dataset

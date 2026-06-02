@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from collections import Counter
 
-DATASET_PATH = Path(r"C:\laragon\www\Porci-Integral-backend\storage\app\public\dataset\animales")
+DATASET_PATH = Path(r"C:\laragon\www\Porci-Integral-backend\storage\app\public\datasets\animales")
 TARGET_MIN = 200  # imágenes ideales por clase
 CRITICAL = 50     # mínimo crítico
 

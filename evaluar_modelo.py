@@ -234,8 +234,8 @@ def main():
                         help="Ruta al modelo .keras o .h5")
     parser.add_argument("--test-set", default=str(OUTPUT_DIR / "test_set.csv"),
                         help="Ruta al CSV de test")
-    parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Umbral de confianza (default: 0.5)")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Umbral de confianza (default: desde classes.json o 0.20)")
     parser.add_argument("--tta", action="store_true", default=False,
                         help="Usar Test-Time Augmentation (4 predicciones promediadas)")
     parser.add_argument("--save", action="store_true", default=True,
@@ -263,8 +263,12 @@ def main():
     else:
         class_names = utils.load_classes()
 
+    # Load threshold from classes.json if not explicitly provided via CLI
+    if args.threshold is None:
+        args.threshold = utils.load_threshold(classes_path)
+
     logger.info(f"Clases: {class_names} ({len(class_names)} total)")
-    logger.info(f"Threshold: {args.threshold}")
+    logger.info(f"Threshold: {args.threshold} (from classes.json)" if classes_path.exists() else f"Threshold: {args.threshold} (default)")
     logger.info(f"TTA: {'activado' if args.tta else 'desactivado'}")
 
     y_true, y_pred, y_conf, errors = evaluate(

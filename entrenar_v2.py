@@ -58,7 +58,7 @@ utils.load_env()
 BASE_DIR = utils.BASE_DIR
 DATASET_DIR = Path(os.environ.get(
     "DATASET_PATH",
-    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\dataset\animales"
+    r"C:\laragon\www\Porci-Integral-backend\storage\app\public\datasets\animales"
 ))
 OUTPUT_DIR = BASE_DIR / "output_v2"
 MODEL_NAME = "modelo_identificacion_cerdos_v2.h5"
@@ -116,11 +116,39 @@ def main():
     parser.add_argument("--task-dir", default="")
     parser.add_argument("--include-classes", default="",
                         help="Clases a incluir separadas por coma")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs-frozen", type=int, default=60)
+    parser.add_argument("--epochs-finetune", type=int, default=80)
+    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--finetune-lr", type=float, default=0.000001)
+    parser.add_argument("--max-images-per-class", type=int, default=200)
+    parser.add_argument("--max-no-cerdo", type=int, default=80)
+    parser.add_argument("--unfreeze-layers", type=int, default=8)
+    parser.add_argument("--disable-mixup", action="store_true", help="Deshabilita Mixup augmentation")
+    parser.add_argument("--mixup-alpha", type=float, default=0.2)
+    parser.add_argument("--oversample-min", type=int, default=80)
+    parser.add_argument("--focal-gamma", type=float, default=1.5)
+    parser.add_argument("--disable-class-weights", action="store_true", help="Deshabilita balanceo de class weights")
     args = parser.parse_args()
 
     task_dir = args.task_dir
     include_list = [c.strip() for c in args.include_classes.split(",") if c.strip()] \
                    if args.include_classes else None
+
+    # Override constants from args (module-level → local)
+    BATCH_SIZE = args.batch_size
+    EPOCHS_FROZEN = args.epochs_frozen
+    EPOCHS_FINETUNE = args.epochs_finetune
+    LEARNING_RATE = args.lr
+    FINETUNE_LR = args.finetune_lr
+    MAX_IMAGES_PER_CLASS = args.max_images_per_class
+    MAX_NO_CERDO = args.max_no_cerdo
+    UNFREEZE_LAST_N = args.unfreeze_layers
+    USE_MIXUP = not args.disable_mixup
+    MIXUP_ALPHA = args.mixup_alpha
+    OVERSAMPLE_MIN = args.oversample_min
+    FOCAL_GAMMA = args.focal_gamma
+    USE_CLASS_WEIGHTS = not args.disable_class_weights
 
     # ── Imports diferidos (solo se cargan al ejecutar, no al importar) ──
     import tensorflow as tf
@@ -175,6 +203,11 @@ def main():
             if self.phase == "finetune":
                 progress_pct += 50
 
+            try:
+                lr_actual = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+            except AttributeError:
+                lr_actual = float(tf.keras.backend.get_value(self.model.optimizer.lr))
+
             report_progress(
                 self.task_dir,
                 current_epoch=epoch + 1,
@@ -185,6 +218,7 @@ def main():
                 current_val_accuracy=float(val_acc),
                 current_val_loss=float(val_loss),
                 best_val_accuracy=float(self.best_val_acc),
+                lr_actual=lr_actual,
                 progress_pct=progress_pct,
                 message=f"Fase {self.phase}: época {epoch + 1}/{self.total_epochs} "
                         f"- acc: {acc:.4f} - val_acc: {val_acc:.4f}",
@@ -321,16 +355,20 @@ def main():
                     message="Calculando class weights...", progress_pct=5,
                     classes_found=class_names)
 
-    labels = train_generator.classes
-    unique_classes = np.unique(labels)
-    weights = compute_class_weight("balanced", classes=unique_classes, y=labels)
-    class_weight_dict = dict(zip(unique_classes, weights))
+    if USE_CLASS_WEIGHTS:
+        labels = train_generator.classes
+        unique_classes = np.unique(labels)
+        weights = compute_class_weight("balanced", classes=unique_classes, y=labels)
+        class_weight_dict = dict(zip(unique_classes, weights))
 
-    logger.info("   Pesos por clase:")
-    for cls_idx, weight in sorted(class_weight_dict.items()):
-        cls_name = class_names_found[cls_idx]
-        count = int(np.sum(np.array(train_labels) == cls_idx))
-        logger.info(f"   [{cls_idx}] {cls_name}: {count} imgs, weight={weight:.3f}")
+        logger.info("   Pesos por clase:")
+        for cls_idx, weight in sorted(class_weight_dict.items()):
+            cls_name = class_names_found[cls_idx]
+            count = int(np.sum(np.array(train_labels) == cls_idx))
+            logger.info(f"   [{cls_idx}] {cls_name}: {count} imgs, weight={weight:.3f}")
+    else:
+        class_weight_dict = None
+        logger.info("   Class weights deshabilitados por config")
 
     # ── Arquitectura del Modelo ───────────────────────────────
     report_progress(task_dir, status="running", phase="building_model",
@@ -357,7 +395,7 @@ def main():
 
     model.compile(
         optimizer=Adam(learning_rate=LEARNING_RATE),
-        loss=focal_loss(),
+        loss=focal_loss(gamma=FOCAL_GAMMA),
         metrics=["accuracy"],
     )
 
@@ -395,6 +433,19 @@ def main():
         verbose=1,
     )
 
+    if task_dir:
+        try:
+            with open(Path(task_dir) / "history_phase1.json", "w", encoding="utf-8") as _f:
+                json.dump({
+                    "loss": [float(v) for v in history1.history.get("loss", [])],
+                    "accuracy": [float(v) for v in history1.history.get("accuracy", [])],
+                    "val_loss": [float(v) for v in history1.history.get("val_loss", [])],
+                    "val_accuracy": [float(v) for v in history1.history.get("val_accuracy", [])],
+                    "lr": [float(v) for v in history1.history.get("lr", [])],
+                }, _f)
+        except Exception:
+            pass
+
     best_val_acc_phase1 = max(history1.history["val_accuracy"])
     logger.info(f"   Mejor val_accuracy fase 1: {best_val_acc_phase1:.4f}")
 
@@ -408,7 +459,7 @@ def main():
 
     model.compile(
         optimizer=Adam(learning_rate=FINETUNE_LR),
-        loss=focal_loss(),
+        loss=focal_loss(gamma=FOCAL_GAMMA),
         metrics=["accuracy"],
     )
 
@@ -433,6 +484,19 @@ def main():
         callbacks=callbacks_phase2,
         verbose=1,
     )
+
+    if task_dir:
+        try:
+            with open(Path(task_dir) / "history_phase2.json", "w", encoding="utf-8") as _f:
+                json.dump({
+                    "loss": [float(v) for v in history2.history.get("loss", [])],
+                    "accuracy": [float(v) for v in history2.history.get("accuracy", [])],
+                    "val_loss": [float(v) for v in history2.history.get("val_loss", [])],
+                    "val_accuracy": [float(v) for v in history2.history.get("val_accuracy", [])],
+                    "lr": [float(v) for v in history2.history.get("lr", [])],
+                }, _f)
+        except Exception:
+            pass
 
     best_val_acc_phase2 = max(history2.history["val_accuracy"])
     logger.info(f"   Mejor val_accuracy fase 2: {best_val_acc_phase2:.4f}")

@@ -17,8 +17,14 @@ import sys
 import json
 import uuid
 import subprocess
+import os
+import platform
 import shutil
+import subprocess
+import sys
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from datetime import datetime
 
@@ -46,7 +52,7 @@ class TrainingManager:
 
     # ── API Pública ──────────────────────────────────────────
 
-    def start_training(self, include_classes=None, exclude_classes=None) -> str:
+    def start_training(self, include_classes=None, exclude_classes=None, config=None) -> str:
         """
         Inicia un nuevo entrenamiento.
         - Valida que no haya otro en curso
@@ -91,21 +97,60 @@ class TrainingManager:
 
             thread = threading.Thread(
                 target=self._run_training,
-                args=(task_id, task_dir, include_classes, exclude_classes),
+                args=(task_id, task_dir, include_classes, exclude_classes, config),
                 daemon=True,
             )
             thread.start()
 
             return task_id
 
+    def _is_pid_alive(self, pid: int) -> bool:
+        """Verifica si un proceso con el PID dado sigue vivo."""
+        if platform.system() == "Windows":
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                SYNCHRONIZE = 0x00100000
+                PROCESS_QUERY_INFORMATION = 0x0400
+                handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, 0, pid)
+                if not handle:
+                    return False
+                try:
+                    exit_code = ctypes.c_ulong()
+                    kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                    return exit_code.value == 259  # STILL_ACTIVE
+                finally:
+                    kernel32.CloseHandle(handle)
+            except Exception:
+                return False
+        else:
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+
     def get_status(self, task_id: str) -> dict:
         """
         Retorna el estado actual de una tarea.
         Busca primero en memoria, luego en disco.
+        Si la tarea fue interrumpida por reinicio, verifica que el
+        subproceso siga vivo antes de recuperar el progreso desde disco.
         """
         with self.lock:
             if task_id in self.tasks:
-                return self.tasks[task_id]
+                task = self.tasks[task_id]
+                if task.get("status") == "error" and "Interrumpido" in task.get("message", ""):
+                    task_dir = TASKS_DIR / task_id
+                    if task_dir.exists():
+                        disk = self._load_progress(task_dir)
+                        if disk and disk.get("status") in ("running", "starting"):
+                            pid = disk.get("pid")
+                            if pid and self._is_pid_alive(int(pid)):
+                                self.tasks[task_id] = disk
+                                return disk
+                            return task
+                return task
 
             task_dir = TASKS_DIR / task_id
             if task_dir.exists():
@@ -129,7 +174,8 @@ class TrainingManager:
     def get_all_tasks(self) -> list:
         """
         Retorna lista completa de tareas (ordenadas por fecha DESC).
-        Lee directamente del disco para incluir tareas de sesiones anteriores.
+        Lee del disco pero usa el estado en memoria si está disponible
+        (para reflejar tareas marcadas como 'error' tras reinicio).
         """
         tasks = []
         if TASKS_DIR.exists():
@@ -137,21 +183,26 @@ class TrainingManager:
                 if d.is_dir():
                     p = self._load_progress(d)
                     if p:
+                        tid = p.get("task_id", d.name)
+                        mem = self.tasks.get(tid)
+                        status = mem.get("status") if mem else p.get("status", "unknown")
+                        message = mem.get("message") if mem else p.get("message", "")
                         tasks.append({
-                            "task_id": p.get("task_id", d.name),
-                            "status": p.get("status", "unknown"),
+                            "task_id": tid,
+                            "status": status,
                             "best_val_accuracy": p.get("best_val_accuracy", 0),
                             "classes_found": p.get("classes_found", []),
                             "started_at": p.get("started_at"),
-                            "finished_at": p.get("finished_at"),
-                            "message": p.get("message", ""),
+                            "finished_at": mem.get("finished_at") if mem else p.get("finished_at"),
+                            "message": message,
                         })
         return tasks
 
     # ── Ejecución del Entrenamiento ───────────────────────────
 
     def _run_training(self, task_id: str, task_dir: Path,
-                      include_classes: list = None, exclude_classes: list = None):
+                      include_classes: list = None, exclude_classes: list = None,
+                      config: dict = None):
         """
         Ejecuta entrenar_v2.py como subproceso.
         Corre en un thread daemon — el manager monitorea la salida
@@ -170,6 +221,32 @@ class TrainingManager:
             if include_classes:
                 cmd += ["--include-classes", ",".join(include_classes)]
 
+            # Config args from frontend
+            if config:
+                config_map = {
+                    "batch_size": "--batch-size",
+                    "epochs_frozen": "--epochs-frozen",
+                    "epochs_finetune": "--epochs-finetune",
+                    "lr": "--lr",
+                    "finetune_lr": "--finetune-lr",
+                    "max_images_per_class": "--max-images-per-class",
+                    "max_no_cerdo": "--max-no-cerdo",
+                    "unfreeze_layers": "--unfreeze-layers",
+                    "disable_mixup": "--disable-mixup",
+                    "mixup_alpha": "--mixup-alpha",
+                    "oversample_min": "--oversample-min",
+                    "focal_gamma": "--focal-gamma",
+                    "disable_class_weights": "--disable-class-weights",
+                }
+                for key, flag in config_map.items():
+                    if key in config:
+                        val = config[key]
+                        if isinstance(val, bool):
+                            if val:
+                                cmd.append(flag)
+                        else:
+                            cmd.extend([flag, str(val)])
+
             process = subprocess.Popen(
                 cmd,
                 cwd=str(BASE_DIR),
@@ -178,6 +255,9 @@ class TrainingManager:
                 text=True,
                 bufsize=1,
             )
+
+            # Guardar PID para verificar supervivencia tras reinicio
+            self._update_status(task_id, task_dir, pid=process.pid)
 
             # Monitoreo de línea por línea del output
             for line in process.stdout:
@@ -227,10 +307,14 @@ class TrainingManager:
                     best_val_accuracy=acc,
                 )
             elif return_code != 0 and not self._is_cancelled(task_id):
+                error_lines = [l for l in _stderr_output.strip().splitlines()[-8:] if l.strip()]
+                error_snippet = "\n".join(error_lines) if error_lines else "Sin detalles"
+                log_name = f"train_{task_id}_error.log" if _stderr_output.strip() else None
                 self._update_status(
                     task_id, task_dir,
                     status="error",
-                    message=f"Error: proceso terminó con código {return_code}",
+                    message=f"Error (código {return_code}):\n{error_snippet}",
+                    error_log=log_name,
                     finished_at=datetime.now().isoformat(),
                 )
 
@@ -295,6 +379,7 @@ class TrainingManager:
         Carga el índice de tareas desde disco.
         Las tareas que estaban 'running' al momento del reinicio
         se marcan como 'error' para mantener consistencia.
+        También persiste el cambio en progress.json y tasks_index.json.
         """
         path = TASKS_DIR / TASKS_INDEX
         if not path.exists():
@@ -302,12 +387,17 @@ class TrainingManager:
         try:
             with open(path) as f:
                 data = json.load(f)
+            changed = False
             for task_id, task in data.items():
                 if task.get("status") in ("running", "starting"):
                     task["status"] = "error"
                     task["message"] = "Interrumpido por reinicio del servicio"
                     task["finished_at"] = datetime.now().isoformat()
+                    self._save_progress(TASKS_DIR / task_id, task)
+                    changed = True
                 self.tasks[task_id] = task
+            if changed:
+                self._persist_tasks()
         except Exception:
             pass
 
@@ -315,6 +405,7 @@ class TrainingManager:
         """
         Busca directorios de tareas en disco que no estén en el índice
         y los incorpora. Esto cubre el caso de migraciones o archivos sueltos.
+        Las tareas 'running' sin un PID vivo se marcan como 'error'.
         """
         if not TASKS_DIR.exists():
             return
@@ -325,6 +416,13 @@ class TrainingManager:
                     continue
                 tid = p.get("task_id", d.name)
                 if tid not in self.tasks:
+                    if p.get("status") in ("running", "starting"):
+                        pid = p.get("pid")
+                        if not pid or not self._is_pid_alive(int(pid)):
+                            p["status"] = "error"
+                            p["message"] = "Interrumpido por reinicio del servicio"
+                            p["finished_at"] = datetime.now().isoformat()
+                            self._save_progress(d, p)
                     self.tasks[tid] = p
 
     def _cleanup_old_tasks(self):

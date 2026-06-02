@@ -19,7 +19,7 @@ from PIL import Image
 
 BASE_DIR = Path(__file__).resolve().parent
 IMG_SIZE = (224, 224)
-DEFAULT_THRESHOLD = 0.50
+DEFAULT_THRESHOLD = 0.20
 NEGATIVE_CLASS = "no_cerdo"  # folder name for negative/non-pig samples
 
 
