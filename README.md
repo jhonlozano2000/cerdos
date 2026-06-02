@@ -142,3 +142,55 @@ Configurable via `DATASET_PATH` en `.env`.
 - MobileNetV2 con pesos ImageNet
 - Data augmentation: rotación, zoom, flip, brillo
 - Class weighting automático
+
+## Setup Portátil (sin Laragon)
+
+### Requisitos
+- Python 3.10+ (descargar de python.org)
+- Pip instalado
+
+### Instalación
+
+```powershell
+# 1. Crear entorno virtual
+python -m venv .venv
+
+# 2. Activar
+.\.venv\Scripts\Activate.ps1   # PowerShell
+# o
+.\.venv\Scripts\activate       # CMD
+
+# 3. Instalar dependencias
+pip install -r requirements.txt
+
+# 4. Configurar variables de entorno (crear .env)
+cp env.example .env
+```
+
+### Configuración del .env
+
+```env
+# Ruta al dataset de fotos de animales (backend Laravel)
+DATASET_PATH=C:\laragon\www\Porci-Integral-backend\storage\app\public\fotos_animales
+
+# API Key para autenticación con backend (opcional)
+AI_API_KEY=tu_api_key_aqui
+```
+
+### Iniciar Servicio
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+uvicorn app_fastapi:app --host 0.0.0.0 --port 8000
+```
+
+Verificar en: `http://127.0.0.1:8000/docs` (Swagger UI interactivo)
+
+### Solución de Problemas
+
+| Problema | Solución |
+|----------|----------|
+| `Fatal error in launcher` | Recrear venv: `rmdir /s /q .venv && python -m venv .venv` |
+| `ExecutionPolicy` | `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` |
+| Modelo no carga | Verificar que `modelo_identificacion_cerdos.h5` existe en la raíz |
+| Dataset no encontrado | Configurar `DATASET_PATH` en `.env` con ruta válida |
