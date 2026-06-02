@@ -1,0 +1,13 @@
+[
+  {
+    "version": "20260602_031407",
+    "date": "2026-06-02T03:14:07.225132",
+    "val_accuracy_phase1": 0.8860759735107422,
+    "val_accuracy_phase2": 0.8354430198669434,
+    "val_accuracy_final": 0.8860759735107422,
+    "num_classes": 8,
+    "total_train_images": 770,
+    "total_val_images": 237,
+    "model_path": "C:\\Users\\Jhon\\Desktop\\cerdos\\output_v2\\modelo_identificacion_cerdos_v2.h5"
+  }
+]
